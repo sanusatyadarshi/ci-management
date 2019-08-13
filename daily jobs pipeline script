@@ -1,0 +1,138 @@
+!groovy
+
+// Copyright IBM Corp All Rights Reserved
+//
+// SPDX-License-Identifier: Apache-2.0
+//
+
+@Library("fabric-ci-lib") _ // global shared library from ci-management repository
+timestamps { // set the timestamps on the jenkins console
+  timeout(240) { // Build timeout set to 240 mins
+    if(env.NODE_ARCH != "hyp-x") {
+      node ('hyp-z') { // trigger jobs on s390x builds nodes
+        buildStages() // call buildStages
+      } //End node
+    } else {
+      node ('hyp-x') { // trigger jobs on x86_64 builds nodes
+        buildStages() // call buildStages
+      } //End node
+    }
+  } // End timeout
+} //End timestamps
+
+def buildStages() {
+    try {
+      def ROOTDIR = pwd() // workspace dir (/w/workspace/<job_name>)
+      def failure_stage = "none"
+      // set MARCH value to amd64, s390x, ppc64le
+      env. MARCH = sh(returnStdout: true, script: "uname -m | sed 's/x86_64/amd64/g'").trim()
+
+      stage('Clean Environment') {
+        // delete working directory
+        deleteDir()
+        // Clean build environment before start the build
+        fabBuildLibrary.cleanupEnv()
+        // Display jenkins environment details
+        fabBuildLibrary.envOutput()
+      }
+
+      stage('Checkout SCM') {
+        // Get changes from gerrit
+        fabBuildLibrary.cloneScm 'fabric fabric-ca','master'
+        // Load properties from ci.properties file
+        props = fabBuildLibrary.loadProperties()
+      }
+
+      stage("Pull Artifacts") {
+        dir("$ROOTDIR/$BASE_DIR") {
+            // Pull Docker Images from nexus3
+            fabBuildLibrary.pullDockerImages(props["FAB_BASE_VERSION"], props["NIGHTLY_IMAGES_LIST"])
+        }
+      }
+
+      stage("Build Artifacts") {
+        dir("$ROOTDIR/$BASE_DIR") {
+            // Build Docker Images
+            env.GOROOT = "/opt/go/go" + props["GO_VER"] + ".linux." + "$MARCH"
+            GOPATH = "$WORKSPACE/gopath"
+            env.PATH = "$GOROOT/bin:$GOPATH/bin:$PATH"
+            fabBuildLibrary.fabBuildImages('fabric', 'docker dist')
+            fabBuildLibrary.fabBuildImages('fabric-ca')
+            fabBuildLibrary.fabBuildImages('fabric-ca', 'docker dist')
+        }
+      }
+
+      // Run Byfn_Eyfn Tests)
+      stage("Byfn_Eyfn Tests") {
+        wrap([$class: 'AnsiColorBuildWrapper', 'colorMapName': 'xterm']) {
+          try {
+            dir("$ROOTDIR/$PROJECT_DIR/fabric-samples") {
+              fabBuildLibrary.cloneRepo 'fabric-samples'
+              sh 'cd scripts/ && ./ciScript.sh ----byfn_eyfn_Tests'
+            }
+          }
+          catch (err) {
+            failure_stage = "Byfn_Eyfn_Tests"
+            currentBuild.result = 'FAILURE'
+            throw err
+          }
+        }
+      }
+
+      // Publish Images & binaries to nexus repositories
+      stage("Publish Artifacts") {
+        configFileProvider([configFile(fileId: 'fabric-settings', variable: 'SETTINGS_FILE')]) {
+          wrap([$class: 'AnsiColorBuildWrapper', 'colorMapName': 'xterm']) {
+            try {
+              dir("${ROOTDIR}/$PROJECT_DIR/fabric/") {
+              sh 'make publish-images PROJECT_VERSION=$PUSH_VERSION DOCKER_NS=$NEXUS_NS'
+              }
+            }
+            catch (err) {
+              failure_stage = "publish_Artifacts"
+              currentBuild.result = 'FAILURE'
+              throw err
+            }
+          }
+        }
+      }
+
+      stage("Downstream") {
+        wrap([$class: 'AnsiColorBuildWrapper', 'colorMapName': 'xterm']) {
+          if(env.NODE_ARCH != "hyp-z") {
+            try {
+            parallel (
+              Behave_Test: {
+                build job: 'fabric-test-daily-behave-master-x86_64', parameters: [string(name: 'GIT_COMMIT', value: GIT_COMMIT)]
+              },
+              Ca_Test: {
+                build job: 'fabric-test-daily-ca-master-x86_64', parameters: [string(name: 'GIT_COMMIT', value: GIT_COMMIT)]
+              },
+              LTE_Test: {
+                build job: 'fabric-test-daily-lte-master-x86_64', parameters: [string(name: 'GIT_COMMIT', value: GIT_COMMIT)]
+              },
+              OTE_Test: {
+                build job: 'fabric-test-daily-ote-master-x86_64', parameters: [string(name: 'GIT_COMMIT', value: GIT_COMMIT)]
+              },
+              PTE_Test: {
+                build job: 'fabric-test-daily-pte-master-x86_64', parameters: [string(name: 'GIT_COMMIT', value: GIT_COMMIT)]
+              },
+              failFast: false)
+            }
+            catch (err) {
+              failure_stage = "Downstream"
+              currentBuild.result = 'FAILURE'
+              throw err
+            }
+          }
+        }
+      }
+
+    } finally { // post build actions
+          if (currentBuild.result == 'FAILURE') {
+            // Send notification to rocketChat channel
+            // Send merge build failure email notifications to the submitter
+            //sendNotifications(currentBuild.result, props["CHANNEL_NAME"])
+          }
+      } // end finally block
+} // end buildStages
